@@ -11,16 +11,32 @@ A lightweight React + Vite console for orchestrating Docker containers and reque
 
 ## Getting started
 
+1. **Install dependencies** (Node 18+ recommended):
+
 ```bash
 npm install
-npm run dev
 ```
 
-By default API requests are made relative to the hosting origin. To point at a specific backend, create a `.env` file and set:
+2. **Configure backend URLs** (optional). Create a `.env` file if your backend is not hosted at the same origin:
 
 ```
 VITE_API_BASE_URL=http://localhost:8080
 VITE_WS_BASE_URL=ws://localhost:8080
+```
+
+3. **Run the app locally**:
+
+```bash
+npm run dev
+```
+
+The dev server prints a local URL (e.g., `http://localhost:5173`). Open it in your browser. API calls will be sent to `VITE_API_BASE_URL` and WebSocket connections to `VITE_WS_BASE_URL`.
+
+4. **Build and preview production assets** (optional):
+
+```bash
+npm run build
+npm run preview
 ```
 
 ## Submodules
