@@ -3,22 +3,61 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '';
 const WS_BASE_URL = import.meta.env.VITE_WS_BASE_URL ?? '';
 
+interface PortMapping {
+  containerPort: number;
+  hostPort?: number;
+  protocol?: string;
+}
+
+interface EnvVar {
+  name: string;
+  value?: string;
+  secret?: boolean;
+}
+
+interface VolumeMount {
+  hostPathOrVolume: string;
+  containerPath: string;
+  mode?: string;
+}
+
+interface DockerServiceConfig {
+  id?: number;
+  name: string;
+  containerName: string;
+  description?: string;
+  image: string;
+  command?: string;
+  entrypoint?: string;
+  restartPolicy?: string;
+  networkMode?: string;
+  networkName?: string;
+  ports?: PortMapping[];
+  envVars?: EnvVar[];
+  volumes?: VolumeMount[];
+}
+
+interface DockerContainerStatus {
+  configId?: number;
+  configName?: string;
+  containerId?: string;
+  containerName?: string;
+  status?: string;
+  running?: boolean;
+  expectedRunning?: boolean;
+  pid1Running?: boolean;
+  attentionNeeded?: boolean;
+}
+
+interface DockerStatusEvent {
+  statuses: DockerContainerStatus[];
+  generatedAtEpochMs: number;
+}
+
 interface TerminalSessionDescriptor {
   containerId: string;
   cmd?: string | null;
   websocketPath: string;
-}
-
-interface DockerContainerStatus {
-  containerId?: string;
-  configId?: number | string;
-  state?: string;
-  image?: string;
-  name?: string;
-  createdAt?: string;
-  startedAt?: string;
-  additionalInfo?: Record<string, unknown>;
-  [key: string]: unknown;
 }
 
 const defaultHeaders = {
@@ -62,38 +101,32 @@ function Badge({ label }: { label: string }) {
   return <span className="badge">{label}</span>;
 }
 
+function MetaRow({ label, value }: { label: string; value?: string | number | boolean | null }) {
+  if (value === undefined || value === null || value === '') return null;
+  return (
+    <div>
+      <dt>{label}</dt>
+      <dd>{String(value)}</dd>
+    </div>
+  );
+}
+
 function DockerStatusCard({ status }: { status: DockerContainerStatus }) {
   return (
     <div className="card">
       <div className="card-header">
-        <div className="card-title">{status.name || status.containerId || 'Container'}</div>
-        {status.state && <Badge label={String(status.state)} />}
+        <div className="card-title">{status.containerName || status.configName || status.containerId || 'Container'}</div>
+        {status.status && <Badge label={String(status.status)} />}
       </div>
       <dl className="meta-grid">
-        {status.containerId && (
-          <div>
-            <dt>Container ID</dt>
-            <dd>{String(status.containerId)}</dd>
-          </div>
-        )}
-        {status.configId !== undefined && (
-          <div>
-            <dt>Config ID</dt>
-            <dd>{String(status.configId)}</dd>
-          </div>
-        )}
-        {status.image && (
-          <div>
-            <dt>Image</dt>
-            <dd>{status.image}</dd>
-          </div>
-        )}
-        {status.startedAt && (
-          <div>
-            <dt>Started</dt>
-            <dd>{status.startedAt}</dd>
-          </div>
-        )}
+        <MetaRow label="Container ID" value={status.containerId} />
+        <MetaRow label="Config ID" value={status.configId} />
+        <MetaRow label="Config name" value={status.configName} />
+        <MetaRow label="Container name" value={status.containerName} />
+        <MetaRow label="Running" value={status.running} />
+        <MetaRow label="Expected running" value={status.expectedRunning} />
+        <MetaRow label="PID1 running" value={status.pid1Running} />
+        <MetaRow label="Attention needed" value={status.attentionNeeded} />
       </dl>
       <details className="details">
         <summary>Raw payload</summary>
@@ -105,11 +138,39 @@ function DockerStatusCard({ status }: { status: DockerContainerStatus }) {
 
 function App() {
   const [configId, setConfigId] = useState('');
+  const [configs, setConfigs] = useState<DockerServiceConfig[]>([]);
+  const [configForm, setConfigForm] = useState<{
+    name: string;
+    containerName: string;
+    description: string;
+    image: string;
+    command: string;
+    entrypoint: string;
+    restartPolicy: string;
+    networkMode: string;
+    networkName: string;
+    portsText: string;
+    envVarsText: string;
+    volumesText: string;
+  }>({
+    name: '',
+    containerName: '',
+    description: '',
+    image: '',
+    command: '',
+    entrypoint: '',
+    restartPolicy: 'always',
+    networkMode: 'bridge',
+    networkName: '',
+    portsText: '[{"containerPort":80,"hostPort":8080,"protocol":"tcp"}]',
+    envVarsText: '[{"name":"APP_ENV","value":"prod","secret":false}]',
+    volumesText: '[{"hostPathOrVolume":"/data","containerPath":"/var/www","mode":"rw"}]',
+  });
   const [forceRemove, setForceRemove] = useState(false);
   const [containerId, setContainerId] = useState('');
   const [command, setCommand] = useState('');
   const [statuses, setStatuses] = useState<DockerContainerStatus[]>([]);
-  const [broadcastResult, setBroadcastResult] = useState<unknown>(null);
+  const [broadcastResult, setBroadcastResult] = useState<DockerStatusEvent | null>(null);
   const [descriptor, setDescriptor] = useState<TerminalSessionDescriptor | null>(null);
   const [feedback, setFeedback] = useState('');
   const [terminalMessages, setTerminalMessages] = useState<string[]>([]);
@@ -131,6 +192,98 @@ function App() {
 
   const appendTerminalMessage = (message: string) => {
     setTerminalMessages((prev) => [...prev, message]);
+  };
+
+  const parseJsonArray = <T,>(label: string, text: string): T[] | undefined => {
+    const trimmed = text.trim();
+    if (!trimmed) return undefined;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) return parsed as T[];
+      throw new Error(`${label} must be an array.`);
+    } catch (error) {
+      console.error(error);
+      throw new Error(`${label} JSON is invalid.`);
+    }
+  };
+
+  const handleFetchConfigs = async () => {
+    try {
+      setFeedback('Loading Docker service configurations...');
+      const response = await fetch(buildApiUrl('/api/docker/configs'));
+      if (!response.ok) throw new Error(await response.text());
+      const payload: DockerServiceConfig[] = await response.json();
+      setConfigs(payload);
+      setFeedback(`Loaded ${payload.length} configuration(s).`);
+    } catch (error) {
+      console.error(error);
+      setFeedback('Unable to fetch Docker configurations.');
+    }
+  };
+
+  const handleLoadConfigById = async () => {
+    if (!configId) {
+      setFeedback('Provide a config ID before loading details.');
+      return;
+    }
+    try {
+      setFeedback('Loading configuration details...');
+      const response = await fetch(buildApiUrl(`/api/docker/configs/${configId}`));
+      if (!response.ok) throw new Error(await response.text());
+      const payload: DockerServiceConfig = await response.json();
+      setConfigForm({
+        name: payload.name ?? '',
+        containerName: payload.containerName ?? '',
+        description: payload.description ?? '',
+        image: payload.image ?? '',
+        command: payload.command ?? '',
+        entrypoint: payload.entrypoint ?? '',
+        restartPolicy: payload.restartPolicy ?? '',
+        networkMode: payload.networkMode ?? '',
+        networkName: payload.networkName ?? '',
+        portsText: payload.ports?.length ? JSON.stringify(payload.ports, null, 2) : '',
+        envVarsText: payload.envVars?.length ? JSON.stringify(payload.envVars, null, 2) : '',
+        volumesText: payload.volumes?.length ? JSON.stringify(payload.volumes, null, 2) : '',
+      });
+      setFeedback('Configuration loaded. You can edit and re-submit.');
+    } catch (error) {
+      console.error(error);
+      setFeedback('Unable to load configuration.');
+    }
+  };
+
+  const handleCreateConfig = async () => {
+    try {
+      const body: DockerServiceConfig = {
+        name: configForm.name,
+        containerName: configForm.containerName,
+        description: configForm.description || undefined,
+        image: configForm.image,
+        command: configForm.command || undefined,
+        entrypoint: configForm.entrypoint || undefined,
+        restartPolicy: configForm.restartPolicy || undefined,
+        networkMode: configForm.networkMode || undefined,
+        networkName: configForm.networkName || undefined,
+        ports: parseJsonArray<PortMapping>('Ports', configForm.portsText),
+        envVars: parseJsonArray<EnvVar>('Env vars', configForm.envVarsText),
+        volumes: parseJsonArray<VolumeMount>('Volumes', configForm.volumesText),
+      };
+
+      setFeedback('Creating Docker service configuration...');
+      const response = await fetch(buildApiUrl('/api/docker/configs'), {
+        method: 'POST',
+        headers: defaultHeaders,
+        body: JSON.stringify(body),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload: DockerServiceConfig = await response.json();
+      setFeedback(`Configuration ${payload.id ?? ''} created.`);
+      setConfigId(payload.id?.toString() ?? '');
+      handleFetchConfigs();
+    } catch (error) {
+      console.error(error);
+      setFeedback('Failed to create Docker service configuration.');
+    }
   };
 
   const handleStartContainer = async () => {
@@ -195,8 +348,9 @@ function App() {
         method: 'POST',
       });
       if (!response.ok) throw new Error(await response.text());
-      const payload = await response.json();
+      const payload: DockerStatusEvent = await response.json();
       setBroadcastResult(payload);
+      setStatuses(payload.statuses ?? []);
       setFeedback('Broadcast triggered successfully.');
     } catch (error) {
       console.error(error);
@@ -271,10 +425,10 @@ function App() {
       <header className="hero">
         <div>
           <p className="eyebrow">Portfolio utilities</p>
-          <h1>Docker &amp; Terminal Console</h1>
+          <h1>Portfolio Docker control plane</h1>
           <p className="lede">
-            Start and stop Docker containers, broadcast their statuses, and open interactive terminal sessions via the
-            provided backend endpoints.
+            Connect to the Portfolio API described in the ICD to manage Docker service configurations, launch
+            containers, broadcast status updates, and attach to in-container terminals over WebSockets.
           </p>
         </div>
         <div className="pill-group">
@@ -283,6 +437,201 @@ function App() {
           <Badge label="React + Vite" />
         </div>
       </header>
+
+      <section className="panel">
+        <div className="panel-header">
+          <div>
+            <p className="eyebrow">Docker</p>
+            <h2>Service configurations</h2>
+          </div>
+          <div className="button-row">
+            <button onClick={handleFetchConfigs}>List configs</button>
+            <button onClick={handleLoadConfigById} className="secondary">
+              Load by ID
+            </button>
+          </div>
+        </div>
+
+        <p className="muted">
+          Fields map directly to the <code>DockerServiceConfig</code> object defined in the ICD. Use JSON arrays for
+          ports, environment variables, and volume mounts to preserve the expected shapes.
+        </p>
+
+        <div className="form-grid">
+          <label className="field">
+            <span>Name</span>
+            <input
+              type="text"
+              value={configForm.name}
+              onChange={(event) => setConfigForm({ ...configForm, name: event.target.value })}
+              placeholder="nginx"
+            />
+          </label>
+          <label className="field">
+            <span>Container name</span>
+            <input
+              type="text"
+              value={configForm.containerName}
+              onChange={(event) => setConfigForm({ ...configForm, containerName: event.target.value })}
+              placeholder="nginx"
+            />
+          </label>
+          <label className="field">
+            <span>Description</span>
+            <input
+              type="text"
+              value={configForm.description}
+              onChange={(event) => setConfigForm({ ...configForm, description: event.target.value })}
+              placeholder="Reverse proxy"
+            />
+          </label>
+          <label className="field">
+            <span>Image</span>
+            <input
+              type="text"
+              value={configForm.image}
+              onChange={(event) => setConfigForm({ ...configForm, image: event.target.value })}
+              placeholder="nginx:latest"
+            />
+          </label>
+          <label className="field">
+            <span>Command override</span>
+            <input
+              type="text"
+              value={configForm.command}
+              onChange={(event) => setConfigForm({ ...configForm, command: event.target.value })}
+              placeholder={'bash -lc "echo hi"'}
+            />
+          </label>
+          <label className="field">
+            <span>Entrypoint override</span>
+            <input
+              type="text"
+              value={configForm.entrypoint}
+              onChange={(event) => setConfigForm({ ...configForm, entrypoint: event.target.value })}
+              placeholder="/docker-entrypoint.sh"
+            />
+          </label>
+          <label className="field">
+            <span>Restart policy</span>
+            <input
+              type="text"
+              value={configForm.restartPolicy}
+              onChange={(event) => setConfigForm({ ...configForm, restartPolicy: event.target.value })}
+              placeholder="always"
+            />
+          </label>
+          <label className="field">
+            <span>Network mode</span>
+            <input
+              type="text"
+              value={configForm.networkMode}
+              onChange={(event) => setConfigForm({ ...configForm, networkMode: event.target.value })}
+              placeholder="bridge"
+            />
+          </label>
+          <label className="field">
+            <span>Network name</span>
+            <input
+              type="text"
+              value={configForm.networkName}
+              onChange={(event) => setConfigForm({ ...configForm, networkName: event.target.value })}
+              placeholder="custom overlay"
+            />
+          </label>
+        </div>
+
+        <div className="form-grid">
+          <label className="field">
+            <span>Ports JSON array</span>
+            <textarea
+              value={configForm.portsText}
+              onChange={(event) => setConfigForm({ ...configForm, portsText: event.target.value })}
+              rows={4}
+            />
+          </label>
+          <label className="field">
+            <span>Env vars JSON array</span>
+            <textarea
+              value={configForm.envVarsText}
+              onChange={(event) => setConfigForm({ ...configForm, envVarsText: event.target.value })}
+              rows={4}
+            />
+          </label>
+          <label className="field">
+            <span>Volumes JSON array</span>
+            <textarea
+              value={configForm.volumesText}
+              onChange={(event) => setConfigForm({ ...configForm, volumesText: event.target.value })}
+              rows={4}
+            />
+          </label>
+        </div>
+
+        <div className="form-grid">
+          <label className="field">
+            <span>Config ID (for lookups)</span>
+            <input
+              type="number"
+              value={configId}
+              onChange={(event) => setConfigId(event.target.value)}
+              placeholder="e.g. 42"
+            />
+          </label>
+          <div className="button-row">
+            <button onClick={handleCreateConfig}>Create configuration</button>
+            <button
+              onClick={() => {
+                setConfigForm({
+                  name: '',
+                  containerName: '',
+                  description: '',
+                  image: '',
+                  command: '',
+                  entrypoint: '',
+                  restartPolicy: 'always',
+                  networkMode: 'bridge',
+                  networkName: '',
+                  portsText: '',
+                  envVarsText: '',
+                  volumesText: '',
+                });
+                setFeedback('Cleared form.');
+              }}
+              className="secondary"
+            >
+              Clear form
+            </button>
+          </div>
+        </div>
+
+        {configs.length > 0 && (
+          <div className="card-grid">
+            {configs.map((config) => (
+              <div key={config.id ?? config.name} className="card">
+                <div className="card-header">
+                  <div className="card-title">{config.name}</div>
+                  {config.id !== undefined && <Badge label={`ID: ${config.id}`} />}
+                </div>
+                <dl className="meta-grid">
+                  <MetaRow label="Container name" value={config.containerName} />
+                  <MetaRow label="Image" value={config.image} />
+                  <MetaRow label="Restart policy" value={config.restartPolicy} />
+                  <MetaRow label="Network mode" value={config.networkMode} />
+                  <MetaRow label="Network name" value={config.networkName} />
+                </dl>
+                <details className="details">
+                  <summary>Raw config</summary>
+                  <pre className="code-block">{prettyPrint(config)}</pre>
+                </details>
+                <div className="button-row" style={{ marginTop: '10px' }}>
+                  <button onClick={() => setConfigId(config.id?.toString() ?? '')}>Use for actions</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
 
       <section className="panel">
         <div className="panel-header">
@@ -303,7 +652,7 @@ function App() {
               type="number"
               value={configId}
               onChange={(event) => setConfigId(event.target.value)}
-              placeholder="e.g. 42"
+              placeholder="e.g. 1"
             />
           </label>
           <label className="checkbox">
@@ -327,6 +676,13 @@ function App() {
             <div className="card-header">
               <div className="card-title">Broadcast response</div>
             </div>
+            <dl className="meta-grid">
+              <MetaRow
+                label="Generated at"
+                value={new Date(broadcastResult.generatedAtEpochMs).toLocaleString()}
+              />
+              <MetaRow label="Statuses" value={broadcastResult.statuses.length} />
+            </dl>
             <pre className="code-block">{prettyPrint(broadcastResult)}</pre>
           </div>
         )}
@@ -448,13 +804,13 @@ function App() {
         <div className="panel-header">
           <div>
             <p className="eyebrow">Messaging</p>
-            <h2>Portfolio messaging submodule</h2>
+            <h2>ZeroMQ broadcast channel</h2>
           </div>
         </div>
         <p className="muted">
-          The <code>portfolio-messaging</code> git submodule is included to share message definitions and utilities for
-          Docker container updates. Run <code>git submodule update --init --recursive</code> after cloning to make it
-          available to your tooling.
+          The backend publishes <code>DockerStatusEvent</code> protobuf messages on the <code>docker.status</code> topic via
+          ZeroMQ (<code>tcp://*:5556</code> by default). Use the broadcast button above for an on-demand publish, or subscribe
+          for 5-second streaming updates while containers are running.
         </p>
       </section>
     </div>
